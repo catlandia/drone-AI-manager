@@ -54,6 +54,55 @@ class MissionState:
         self.elapsed_time = 0.0
 
 
+@dataclass
+class DroneSpecs:
+    """
+    Physical specifications of the drone.
+
+    Used for realistic flight calculations.
+    """
+    # Mass properties
+    empty_weight: float = 2.5          # Drone weight without payload (kg)
+    max_payload: float = 2.0           # Maximum cargo weight (kg)
+
+    # Battery properties
+    battery_capacity_wh: float = 100.0  # Battery capacity in Watt-hours
+    battery_voltage: float = 22.2       # Nominal voltage (6S LiPo)
+
+    # Motor/propulsion properties
+    num_motors: int = 4
+    motor_efficiency: float = 0.85      # Motor efficiency factor
+    propeller_efficiency: float = 0.75  # Propeller efficiency factor
+
+    # Flight characteristics
+    cruise_speed: float = 10.0          # Cruise speed in m/s
+    max_speed: float = 15.0             # Maximum speed in m/s
+    climb_rate: float = 3.0             # Vertical climb rate m/s
+    descent_rate: float = 2.0           # Vertical descent rate m/s
+
+    # Power consumption (Watts)
+    hover_power_base: float = 150.0     # Base hover power (empty drone)
+    power_per_kg: float = 50.0          # Additional power per kg payload
+    cruise_power_factor: float = 1.2    # Multiplier vs hover for forward flight
+    climb_power_factor: float = 1.8     # Multiplier vs hover for climbing
+
+    # Safety margins
+    reserve_battery: float = 0.15       # Reserve battery (don't use last 15%)
+
+    def hover_power(self, payload_kg: float = 0.0) -> float:
+        """Calculate hover power consumption in Watts."""
+        total_weight = self.empty_weight + payload_kg
+        return self.hover_power_base + (payload_kg * self.power_per_kg)
+
+    def cruise_power(self, payload_kg: float = 0.0) -> float:
+        """Calculate cruise flight power consumption in Watts."""
+        return self.hover_power(payload_kg) * self.cruise_power_factor
+
+    def climb_power(self, payload_kg: float = 0.0) -> float:
+        """Calculate climbing power consumption in Watts."""
+        return self.hover_power(payload_kg) * self.climb_power_factor
+
+
 class MissionPlanner:
     """
     High-level mission planner for multi-delivery drone operations.
@@ -64,30 +113,37 @@ class MissionPlanner:
     - Battery management decisions
     - Route optimization (TSP-like)
     - Priority-based scheduling
+
+    Uses physics-based calculations for:
+    - Flight time estimation
+    - Battery consumption
+    - Safe travel distance with payload
     """
 
-    # Battery thresholds
+    # Battery thresholds (fraction of usable battery)
     BATTERY_CRITICAL = 0.15    # Must return to base
     BATTERY_LOW = 0.30         # Consider returning
     BATTERY_SAFE = 0.50        # Safe for new deliveries
 
-    # Cost estimation factors
-    DISTANCE_COST_FACTOR = 0.001      # Battery drain per unit distance
-    HOVER_COST_PER_SECOND = 0.0001    # Battery drain for hovering
-    DELIVERY_OVERHEAD = 0.02          # Fixed battery cost per delivery (landing/takeoff)
-
-    def __init__(self, base_position: np.ndarray, battery_capacity: float = 1000.0):
+    def __init__(
+        self,
+        base_position: np.ndarray,
+        battery_capacity: float = 1000.0,
+        drone_specs: Optional[DroneSpecs] = None
+    ):
         """
         Initialize the mission planner.
 
         Args:
             base_position: Home base position for pickups and recharging
-            battery_capacity: Maximum battery capacity in abstract units
+            battery_capacity: Maximum battery capacity in abstract units (legacy)
+            drone_specs: Physical drone specifications for realistic calculations
         """
         if not isinstance(base_position, np.ndarray):
             base_position = np.array(base_position, dtype=np.float32)
         self.base_position = base_position
         self.battery_capacity = battery_capacity
+        self.drone_specs = drone_specs or DroneSpecs()
         self.state = MissionState()
         self._delivery_id_counter = 0
 
@@ -451,3 +507,298 @@ class MissionPlanner:
         if not self.state.pending_deliveries:
             return 0
         return max(d.priority for d in self.state.pending_deliveries)
+
+    # =========================================================================
+    # Physics-Based Calculations
+    # =========================================================================
+
+    def get_max_range(self, payload_kg: float = 0.0) -> float:
+        """
+        Calculate maximum one-way flight range with given payload.
+
+        This is the theoretical max distance before battery is depleted.
+        For safe operation, use get_safe_range() instead.
+
+        Args:
+            payload_kg: Cargo weight in kg
+
+        Returns:
+            Maximum range in meters
+        """
+        specs = self.drone_specs
+
+        # Available energy (Wh) - excluding reserve
+        usable_battery = specs.battery_capacity_wh * (1 - specs.reserve_battery)
+
+        # Power consumption during cruise
+        cruise_power = specs.cruise_power(payload_kg)
+
+        # Flight time in hours
+        flight_time_hours = usable_battery / cruise_power
+
+        # Range in meters
+        max_range = specs.cruise_speed * flight_time_hours * 3600
+
+        return max_range
+
+    def get_safe_range(self, payload_kg: float = 0.0) -> float:
+        """
+        Calculate safe round-trip range with given payload.
+
+        Accounts for:
+        - Outbound flight (with payload)
+        - Return flight (without payload)
+        - Reserve battery
+        - Takeoff/landing overhead
+
+        Args:
+            payload_kg: Cargo weight in kg
+
+        Returns:
+            Safe one-way range in meters (total round trip = 2x this)
+        """
+        specs = self.drone_specs
+
+        # Available energy (Wh)
+        usable_battery = specs.battery_capacity_wh * (1 - specs.reserve_battery)
+
+        # Subtract takeoff/landing overhead (assume 30 seconds hover each way)
+        hover_energy = specs.hover_power(payload_kg) * (60 / 3600)  # 60s total hover
+        usable_battery -= hover_energy
+
+        # Power for outbound (with payload) and return (empty)
+        outbound_power = specs.cruise_power(payload_kg)
+        return_power = specs.cruise_power(0)
+
+        # Time to fly distance D:
+        # outbound: D / cruise_speed hours
+        # return: D / cruise_speed hours
+        # Energy: D/v * outbound_power + D/v * return_power = usable_battery
+        # D * (outbound_power + return_power) / v = usable_battery
+        # D = usable_battery * v / (outbound_power + return_power)
+
+        safe_range = (usable_battery * specs.cruise_speed * 3600) / (outbound_power + return_power)
+
+        return max(0, safe_range)
+
+    def get_flight_time(
+        self,
+        distance: float,
+        payload_kg: float = 0.0,
+        include_vertical: bool = True,
+        altitude_change: float = 0.0
+    ) -> float:
+        """
+        Estimate flight time for a given distance and payload.
+
+        Args:
+            distance: Horizontal distance in meters
+            payload_kg: Cargo weight in kg
+            include_vertical: Whether to include climb/descent time
+            altitude_change: Vertical distance in meters (positive = climb)
+
+        Returns:
+            Estimated flight time in seconds
+        """
+        specs = self.drone_specs
+
+        # Horizontal flight time
+        horizontal_time = distance / specs.cruise_speed
+
+        # Vertical flight time
+        vertical_time = 0.0
+        if include_vertical and altitude_change != 0:
+            if altitude_change > 0:
+                vertical_time = altitude_change / specs.climb_rate
+            else:
+                vertical_time = abs(altitude_change) / specs.descent_rate
+
+        return horizontal_time + vertical_time
+
+    def get_energy_cost(
+        self,
+        distance: float,
+        payload_kg: float = 0.0,
+        altitude_change: float = 0.0
+    ) -> float:
+        """
+        Calculate energy cost for a flight segment.
+
+        Args:
+            distance: Horizontal distance in meters
+            payload_kg: Cargo weight in kg
+            altitude_change: Vertical distance (positive = climb)
+
+        Returns:
+            Energy cost in Watt-hours
+        """
+        specs = self.drone_specs
+
+        # Horizontal cruise energy
+        horizontal_time_hours = (distance / specs.cruise_speed) / 3600
+        cruise_energy = specs.cruise_power(payload_kg) * horizontal_time_hours
+
+        # Vertical energy
+        vertical_energy = 0.0
+        if altitude_change > 0:
+            climb_time_hours = (altitude_change / specs.climb_rate) / 3600
+            vertical_energy = specs.climb_power(payload_kg) * climb_time_hours
+        elif altitude_change < 0:
+            # Descent uses less power (closer to hover)
+            descent_time_hours = (abs(altitude_change) / specs.descent_rate) / 3600
+            vertical_energy = specs.hover_power(payload_kg) * descent_time_hours
+
+        return cruise_energy + vertical_energy
+
+    def get_battery_percentage_cost(
+        self,
+        distance: float,
+        payload_kg: float = 0.0,
+        altitude_change: float = 0.0
+    ) -> float:
+        """
+        Calculate battery percentage used for a flight segment.
+
+        Args:
+            distance: Horizontal distance in meters
+            payload_kg: Cargo weight in kg
+            altitude_change: Vertical distance (positive = climb)
+
+        Returns:
+            Battery percentage used (0.0 to 1.0)
+        """
+        energy_wh = self.get_energy_cost(distance, payload_kg, altitude_change)
+        return energy_wh / self.drone_specs.battery_capacity_wh
+
+    def can_complete_delivery(
+        self,
+        delivery: DeliveryRequest,
+        current_position: Optional[np.ndarray] = None,
+        current_battery: Optional[float] = None
+    ) -> Tuple[bool, dict]:
+        """
+        Check if a delivery can be safely completed.
+
+        Args:
+            delivery: The delivery to check
+            current_position: Current drone position (default: use state)
+            current_battery: Current battery level 0-1 (default: use state)
+
+        Returns:
+            Tuple of (can_complete, details_dict)
+        """
+        if current_position is None:
+            current_position = (
+                self.state.current_delivery.dropzone_position
+                if self.state.current_delivery
+                else self.base_position
+            )
+        if current_battery is None:
+            current_battery = self.state.battery_level
+
+        # Calculate distances
+        to_pickup = np.linalg.norm(delivery.pickup_position - current_position)
+        to_dropzone = np.linalg.norm(
+            delivery.dropzone_position - delivery.pickup_position
+        )
+        to_base = np.linalg.norm(self.base_position - delivery.dropzone_position)
+
+        # Calculate altitude changes
+        alt_to_pickup = delivery.pickup_position[2] - current_position[2]
+        alt_to_dropzone = delivery.dropzone_position[2] - delivery.pickup_position[2]
+        alt_to_base = self.base_position[2] - delivery.dropzone_position[2]
+
+        # Energy costs
+        energy_to_pickup = self.get_energy_cost(to_pickup, 0, alt_to_pickup)
+        energy_to_dropzone = self.get_energy_cost(
+            to_dropzone, delivery.weight, alt_to_dropzone
+        )
+        energy_to_base = self.get_energy_cost(to_base, 0, alt_to_base)
+
+        # Add hover overhead for pickup and dropoff (30s each)
+        hover_overhead = (
+            self.drone_specs.hover_power(delivery.weight) * (30 / 3600) +
+            self.drone_specs.hover_power(0) * (30 / 3600)
+        )
+
+        total_energy = energy_to_pickup + energy_to_dropzone + energy_to_base + hover_overhead
+
+        # Available energy
+        available_wh = current_battery * self.drone_specs.battery_capacity_wh
+        reserve_wh = self.drone_specs.reserve_battery * self.drone_specs.battery_capacity_wh
+        usable_wh = available_wh - reserve_wh
+
+        # Flight times
+        time_to_pickup = self.get_flight_time(to_pickup, 0, True, alt_to_pickup)
+        time_to_dropzone = self.get_flight_time(
+            to_dropzone, delivery.weight, True, alt_to_dropzone
+        )
+        time_to_base = self.get_flight_time(to_base, 0, True, alt_to_base)
+        total_time = time_to_pickup + time_to_dropzone + time_to_base + 60  # +60s overhead
+
+        details = {
+            'can_complete': usable_wh >= total_energy,
+            'energy_required_wh': total_energy,
+            'energy_available_wh': usable_wh,
+            'battery_cost_percent': total_energy / self.drone_specs.battery_capacity_wh,
+            'margin_wh': usable_wh - total_energy,
+            'estimated_time_seconds': total_time,
+            'distance_total_m': to_pickup + to_dropzone + to_base,
+            'segments': {
+                'to_pickup_m': to_pickup,
+                'to_dropzone_m': to_dropzone,
+                'to_base_m': to_base,
+            }
+        }
+
+        return details['can_complete'], details
+
+    def get_range_with_payload(self, payload_kg: float) -> dict:
+        """
+        Get comprehensive range information for a given payload.
+
+        Args:
+            payload_kg: Cargo weight in kg
+
+        Returns:
+            Dictionary with range calculations
+        """
+        specs = self.drone_specs
+
+        if payload_kg > specs.max_payload:
+            return {
+                'error': f'Payload {payload_kg}kg exceeds max {specs.max_payload}kg',
+                'valid': False
+            }
+
+        max_range = self.get_max_range(payload_kg)
+        safe_range = self.get_safe_range(payload_kg)
+
+        # Flight time at safe range
+        safe_flight_time = self.get_flight_time(safe_range * 2, payload_kg)  # Round trip
+
+        # Power consumption
+        hover_power = specs.hover_power(payload_kg)
+        cruise_power = specs.cruise_power(payload_kg)
+
+        # Hover endurance
+        usable_wh = specs.battery_capacity_wh * (1 - specs.reserve_battery)
+        hover_time = (usable_wh / hover_power) * 3600  # seconds
+
+        return {
+            'valid': True,
+            'payload_kg': payload_kg,
+            'max_one_way_range_m': max_range,
+            'safe_round_trip_range_m': safe_range,
+            'hover_endurance_seconds': hover_time,
+            'safe_flight_time_seconds': safe_flight_time,
+            'cruise_speed_mps': specs.cruise_speed,
+            'power_consumption': {
+                'hover_watts': hover_power,
+                'cruise_watts': cruise_power,
+            },
+            'efficiency': {
+                'meters_per_wh': safe_range * 2 / usable_wh,
+                'wh_per_km': usable_wh / (safe_range * 2 / 1000) if safe_range > 0 else float('inf'),
+            }
+        }

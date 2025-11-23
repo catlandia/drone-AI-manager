@@ -13,6 +13,7 @@ from .mission_planner import (
     MissionPlanner,
     MissionState,
     DeliveryRequest,
+    DroneSpecs,
 )
 from .visualization import DroneVisualizer
 
@@ -24,5 +25,6 @@ __all__ = [
     "MissionPlanner",
     "MissionState",
     "DeliveryRequest",
+    "DroneSpecs",
     "DroneVisualizer",
 ]
