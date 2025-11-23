@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drone-ai"
+version = "0.1.0"
+description = "Drone AI delivery system with mission planning"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+dependencies = [
+    "numpy>=1.20.0",
+    "gymnasium>=0.28.0",
+]
+
+[project.optional-dependencies]
+viz = ["pygame>=2.0.0"]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0"]
+all = ["pygame>=2.0.0", "pytest>=7.0.0", "pytest-cov>=4.0.0"]
+
+[project.scripts]
+drone-demo = "drone_ai.demo:main"
+drone-learn = "drone_ai.learning_sequence:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
