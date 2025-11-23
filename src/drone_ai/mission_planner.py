@@ -322,7 +322,7 @@ class MissionPlanner:
         """
         Estimate battery/time cost for a delivery.
 
-        Considers:
+        Uses physics-based calculations considering:
         - Distance from current position to pickup
         - Distance from pickup to dropzone
         - Package weight impact
@@ -349,17 +349,21 @@ class MissionPlanner:
             delivery.dropzone_position - delivery.pickup_position
         )
 
-        total_distance = to_pickup + to_dropzone
+        # Calculate altitude changes
+        alt_to_pickup = delivery.pickup_position[2] - current_pos[2]
+        alt_to_dropzone = delivery.dropzone_position[2] - delivery.pickup_position[2]
 
-        # Base distance cost
-        cost = total_distance * self.DISTANCE_COST_FACTOR
+        # Use physics-based energy calculation
+        energy_to_pickup = self.get_energy_cost(to_pickup, 0, alt_to_pickup)
+        energy_to_dropzone = self.get_energy_cost(to_dropzone, delivery.weight, alt_to_dropzone)
 
-        # Weight multiplier (heavier = more power)
-        weight_multiplier = 1.0 + (delivery.weight - 1.0) * 0.1
-        cost *= weight_multiplier
+        # Add hover overhead (30s at pickup)
+        hover_overhead = self.drone_specs.hover_power(delivery.weight) * (30 / 3600)
 
-        # Delivery overhead
-        cost += self.DELIVERY_OVERHEAD
+        total_energy = energy_to_pickup + energy_to_dropzone + hover_overhead
+
+        # Convert to battery percentage
+        cost = total_energy / self.drone_specs.battery_capacity_wh
 
         return min(cost, 1.0)  # Cap at full battery
 
@@ -371,10 +375,16 @@ class MissionPlanner:
             from_position: Position to return from
 
         Returns:
-            Estimated battery cost
+            Estimated battery cost (0.0 to 1.0)
         """
         distance = np.linalg.norm(self.base_position - from_position)
-        return distance * self.DISTANCE_COST_FACTOR + self.DELIVERY_OVERHEAD * 0.5
+        alt_change = self.base_position[2] - from_position[2]
+
+        return self.get_battery_percentage_cost(
+            distance=distance,
+            payload_kg=0,  # No payload on return
+            altitude_change=alt_change
+        )
 
     def optimize_delivery_order(self) -> List[DeliveryRequest]:
         """
